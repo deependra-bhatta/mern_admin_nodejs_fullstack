@@ -9,8 +9,6 @@ env:
   REGISTRY: ghcr.io
   BACKEND_IMAGE: ghcr.io/${{ github.repository_owner }}/mern-backend
   FRONTEND_IMAGE: ghcr.io/${{ github.repository_owner }}/mern-frontend
-  PIPELINEWATCH_URL: http://192.168.1.71:8080
-  PIPELINEWATCH_KEY: OaJjVk2rYKeLxj1nGl6P8dKofLxOh4OlKP4detdk8tM
 
 permissions:
   contents: read
@@ -24,13 +22,7 @@ jobs:
   build_backend:
     name: Build Backend
     runs-on: ubuntu-latest
-    outputs:
-      duration: ${{ steps.timer.outputs.duration }}
     steps:
-      - name: Start timer
-        id: start
-        run: echo "start=$(date +%s)" >> $GITHUB_OUTPUT
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -56,24 +48,13 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Calculate duration
-        id: timer
-        if: always()
-        run: echo "duration=$(( $(date +%s) - ${{ steps.start.outputs.start }} ))" >> $GITHUB_OUTPUT
-
 # ─────────────────────────────────────────
 # 2. Build & push frontend → GHCR
 # ─────────────────────────────────────────
   build_frontend:
     name: Build Frontend
     runs-on: ubuntu-latest
-    outputs:
-      duration: ${{ steps.timer.outputs.duration }}
     steps:
-      - name: Start timer
-        id: start
-        run: echo "start=$(date +%s)" >> $GITHUB_OUTPUT
-
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -100,11 +81,6 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-      - name: Calculate duration
-        id: timer
-        if: always()
-        run: echo "duration=$(( $(date +%s) - ${{ steps.start.outputs.start }} ))" >> $GITHUB_OUTPUT
-
 # ─────────────────────────────────────────
 # 3. Deploy on self-hosted VM runner
 # ─────────────────────────────────────────
@@ -112,15 +88,40 @@ jobs:
     name: Deploy to Dev VM
     needs: [build_backend, build_frontend]
     runs-on: [self-hosted, Linux, X64]
-    outputs:
-      duration: ${{ steps.timer.outputs.duration }}
+    env:
+      DATABASE: ${{ secrets.DATABASE }}
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      SECRET: ${{ secrets.SECRET }}
+      KEY: ${{ secrets.KEY }}
     steps:
-      - name: Start timer
-        id: start
-        run: echo "start=$(date +%s)" >> $GITHUB_OUTPUT
-
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Create env files
+        run: |
+          {
+            echo "NODE_ENV=production"
+            echo "PORT=8888"
+            echo "MONGO_URI=mongodb://mern-mongodb:27017/mern-admin"
+            echo "JWT_SCHEME=jwt"
+            echo "JWT_TOKEN_PREFIX=Bearer"
+            echo "JWT_TOKEN_EXPIRATION=18000000"
+            echo "JWT_TOKEN_HASH_ALGO=SHA-256"
+          } > backend/.variables.env
+
+          {
+            echo "REACT_APP_API_BASE_URL=/api/"
+            echo "GENERATE_SOURCEMAP=false"
+            echo "REACT_APP_DEV_REMOTE=local"
+          } > frontend/.env
+
+      - name: Ensure docker is accessible
+        run: |
+          if ! docker info > /dev/null 2>&1; then
+            echo "Docker socket not accessible, fixing permissions..."
+            sudo chmod 666 /var/run/docker.sock
+          fi
+          docker info | grep "Server Version"
 
       - name: Login to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
@@ -133,66 +134,9 @@ jobs:
 
       - name: Health check
         run: |
-          sleep 5
+          sleep 10
+          echo "=== Container Status ==="
           docker compose -f docker-compose.yaml ps
-
-      - name: Calculate duration
-        id: timer
-        if: always()
-        run: echo "duration=$(( $(date +%s) - ${{ steps.start.outputs.start }} ))" >> $GITHUB_OUTPUT
-
-# ─────────────────────────────────────────
-# 4. Report to PipelineWatch (always runs)
-#    Real durations captured from each job
-# ─────────────────────────────────────────
-  report:
-    name: Report to PipelineWatch
-    needs: [build_backend, build_frontend, deploy]
-    if: always()
-    runs-on: [self-hosted, Linux, X64]
-    steps:
-      - name: Send report
-        run: |
-          B="${{ needs.build_backend.result }}"
-          F="${{ needs.build_frontend.result }}"
-          D="${{ needs.deploy.result }}"
-
-          BD="${{ needs.build_backend.outputs.duration }}"
-          FD="${{ needs.build_frontend.outputs.duration }}"
-          DD="${{ needs.deploy.outputs.duration }}"
-
-          # Fallback to 0 if empty
-          BD="${BD:-0}"
-          FD="${FD:-0}"
-          DD="${DD:-0}"
-
-          if [[ "$B" == "success" && "$F" == "success" && "$D" == "success" ]]; then
-            STATUS="success"
-          elif [[ "$B" == "cancelled" || "$F" == "cancelled" || "$D" == "cancelled" ]]; then
-            STATUS="cancelled"
-          else
-            STATUS="failure"
-          fi
-
-          TOTAL=$(( BD + DD ))
-
-          curl -s -X POST "${{ env.PIPELINEWATCH_URL }}/webhooks/generic" \
-            -H "X-API-Key: ${{ env.PIPELINEWATCH_KEY }}" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"pipeline\": \"${{ github.workflow }}\",
-              \"repo\": \"${{ github.repository }}\",
-              \"branch\": \"${{ github.ref_name }}\",
-              \"commit\": \"${{ github.sha }}\",
-              \"status\": \"$STATUS\",
-              \"duration_s\": $TOTAL,
-              \"actor\": \"${{ github.actor }}\",
-              \"run_url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
-              \"steps\": [
-                {\"number\": 1, \"name\": \"Build Backend\",    \"status\": \"$B\", \"duration_s\": $BD},
-                {\"number\": 2, \"name\": \"Build Frontend\",   \"status\": \"$F\", \"duration_s\": $FD},
-                {\"number\": 3, \"name\": \"Deploy to Dev VM\", \"status\": \"$D\", \"duration_s\": $DD}
-              ]
-            }"
-
-          echo "Reported → status=$STATUS backend=${BD}s frontend=${FD}s deploy=${DD}s"
+          echo ""
+          echo "=== Recent Logs ==="
+          docker compose -f docker-compose.yaml logs --tail=30
