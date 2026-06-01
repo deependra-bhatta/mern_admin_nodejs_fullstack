@@ -12,7 +12,6 @@ env:
   PIPELINEWATCH_URL: http://192.168.1.71:8080
   PIPELINEWATCH_KEY: OaJjVk2rYKeLxj1nGl6P8dKofLxOh4OlKP4detdk8tM
 
-# Allow pushing packages to GHCR
 permissions:
   contents: read
   packages: write
@@ -25,7 +24,13 @@ jobs:
   build_backend:
     name: Build Backend
     runs-on: ubuntu-latest
+    outputs:
+      duration: ${{ steps.timer.outputs.duration }}
     steps:
+      - name: Start timer
+        id: start
+        run: echo "start=$(date +%s)" >> $GITHUB_OUTPUT
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -51,13 +56,24 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
+      - name: Calculate duration
+        id: timer
+        if: always()
+        run: echo "duration=$(( $(date +%s) - ${{ steps.start.outputs.start }} ))" >> $GITHUB_OUTPUT
+
 # ─────────────────────────────────────────
 # 2. Build & push frontend → GHCR
 # ─────────────────────────────────────────
   build_frontend:
     name: Build Frontend
     runs-on: ubuntu-latest
+    outputs:
+      duration: ${{ steps.timer.outputs.duration }}
     steps:
+      - name: Start timer
+        id: start
+        run: echo "start=$(date +%s)" >> $GITHUB_OUTPUT
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -84,6 +100,11 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
+      - name: Calculate duration
+        id: timer
+        if: always()
+        run: echo "duration=$(( $(date +%s) - ${{ steps.start.outputs.start }} ))" >> $GITHUB_OUTPUT
+
 # ─────────────────────────────────────────
 # 3. Deploy on self-hosted VM runner
 # ─────────────────────────────────────────
@@ -91,7 +112,13 @@ jobs:
     name: Deploy to Dev VM
     needs: [build_backend, build_frontend]
     runs-on: [self-hosted, Linux, X64]
+    outputs:
+      duration: ${{ steps.timer.outputs.duration }}
     steps:
+      - name: Start timer
+        id: start
+        run: echo "start=$(date +%s)" >> $GITHUB_OUTPUT
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -109,8 +136,14 @@ jobs:
           sleep 5
           docker compose -f docker-compose.yaml ps
 
+      - name: Calculate duration
+        id: timer
+        if: always()
+        run: echo "duration=$(( $(date +%s) - ${{ steps.start.outputs.start }} ))" >> $GITHUB_OUTPUT
+
 # ─────────────────────────────────────────
 # 4. Report to PipelineWatch (always runs)
+#    Real durations captured from each job
 # ─────────────────────────────────────────
   report:
     name: Report to PipelineWatch
@@ -124,6 +157,15 @@ jobs:
           F="${{ needs.build_frontend.result }}"
           D="${{ needs.deploy.result }}"
 
+          BD="${{ needs.build_backend.outputs.duration }}"
+          FD="${{ needs.build_frontend.outputs.duration }}"
+          DD="${{ needs.deploy.outputs.duration }}"
+
+          # Fallback to 0 if empty
+          BD="${BD:-0}"
+          FD="${FD:-0}"
+          DD="${DD:-0}"
+
           if [[ "$B" == "success" && "$F" == "success" && "$D" == "success" ]]; then
             STATUS="success"
           elif [[ "$B" == "cancelled" || "$F" == "cancelled" || "$D" == "cancelled" ]]; then
@@ -131,6 +173,8 @@ jobs:
           else
             STATUS="failure"
           fi
+
+          TOTAL=$(( BD + DD ))
 
           curl -s -X POST "${{ env.PIPELINEWATCH_URL }}/webhooks/generic" \
             -H "X-API-Key: ${{ env.PIPELINEWATCH_KEY }}" \
@@ -141,13 +185,14 @@ jobs:
               \"branch\": \"${{ github.ref_name }}\",
               \"commit\": \"${{ github.sha }}\",
               \"status\": \"$STATUS\",
+              \"duration_s\": $TOTAL,
               \"actor\": \"${{ github.actor }}\",
               \"run_url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
               \"steps\": [
-                {\"number\": 1, \"name\": \"Build Backend\",    \"status\": \"$B\"},
-                {\"number\": 2, \"name\": \"Build Frontend\",   \"status\": \"$F\"},
-                {\"number\": 3, \"name\": \"Deploy to Dev VM\", \"status\": \"$D\"}
+                {\"number\": 1, \"name\": \"Build Backend\",    \"status\": \"$B\", \"duration_s\": $BD},
+                {\"number\": 2, \"name\": \"Build Frontend\",   \"status\": \"$F\", \"duration_s\": $FD},
+                {\"number\": 3, \"name\": \"Deploy to Dev VM\", \"status\": \"$D\", \"duration_s\": $DD}
               ]
             }"
 
-          echo "Reported to PipelineWatch: $STATUS"
+          echo "Reported → status=$STATUS backend=${BD}s frontend=${FD}s deploy=${DD}s"
